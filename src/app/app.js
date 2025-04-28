@@ -8,24 +8,28 @@ import cookieParser from "cookie-parser";
 import cors from "cors";
 import helmet from "helmet";
 import compression from "compression";
+import mongoSanitize from "express-mongo-sanitize";
+import morgan from "morgan";
+import rateLimit from "express-rate-limit";
 
-import {
-  CORS_ORIGIN,
-  GOOGLE_SECRET_KEY,
-} from "../constants/constant.config.js";
+import { CORS_ORIGIN, BODY_SIZE_LIMIT } from "../constants/constant.config.js";
 import router from "../routes/router.js";
 import errorHandler from "../middleware/errorHandler.error.js";
 import notFound from "../middleware/notFound.middleware.js";
 
 const app = express();
 
-// Cookie Parser
-app.use(cookieParser());
-
-// // Security Middleware
+/**
+ * Security Middleware Setup
+ */
 app.use(helmet());
+app.use(
+  helmet.contentSecurityPolicy({ directives: { defaultSrc: ["'self'"] } })
+);
 
-// Enable CORS
+/**
+ * CORS Middleware Setup
+ */
 app.use(
   cors({
     origin: CORS_ORIGIN,
@@ -33,23 +37,56 @@ app.use(
   })
 );
 
-// Data Parsing
-app.use(express.json({ limit: "16kb" }));
-app.use(express.urlencoded({ extended: true, limit: "16kb" }));
+/**
+ * Cookie Parser Setup
+ */
+app.use(cookieParser());
 
-// Gzip Compression
+/**
+ * Body Parsers Setup
+ */
+app.use(express.json({ limit: BODY_SIZE_LIMIT || "16kb" }));
+app.use(
+  express.urlencoded({ extended: true, limit: BODY_SIZE_LIMIT || "16kb" })
+);
+
+/**
+ * Logging Middleware (for development)
+ */
+if (process.env.NODE_ENV !== "production") {
+  app.use(morgan("dev"));
+}
+
+/**
+ * Rate Limiting Middleware Setup
+ */
+const apiLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 100,
+  message: "Too many requests from this IP, please try again after 15 minutes",
+});
+
+app.use("/api/v1", apiLimiter);
+
+/**
+ * Compression Middleware Setup
+ */
 app.use(compression());
 
-// Serve Static Files
+/**
+ * Static Files Middleware Setup
+ */
 app.use(express.static("./public"));
 
-// API Routes
+/**
+ * Routes Setup
+ */
 app.use("/api/v1", router);
 
-// Error Handler
-app.use(errorHandler);
-
-// Handle 404 Routes
+/**
+ * Error Handling Middleware Setup
+ */
 app.use(notFound);
+app.use(errorHandler);
 
 export default app;

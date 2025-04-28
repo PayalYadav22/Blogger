@@ -3,19 +3,20 @@
  * @license Apache-2.0
  */
 
-// ==============================
-// Imports
-// ==============================
-
+// External Packages
 import mongoose from "mongoose";
 import bcrypt from "bcrypt";
 import crypto from "crypto";
 import jwt from "jsonwebtoken";
 import validator from "validator";
-import softDeletePlugin from "../plugins/softDelete.plugin.js";
-import sanitize from "mongoose-sanitize";
 import leanVirtuals from "mongoose-lean-virtuals";
 import leanGetters from "mongoose-lean-getters";
+import { StatusCodes } from "http-status-codes";
+
+// Plugins
+import softDeletePlugin from "../plugins/softDelete.plugin.js";
+
+// Constants
 import {
   SALT_ROUND,
   JWT_ACCESS_SECRET,
@@ -24,8 +25,9 @@ import {
   JWT_REFRESH_SECRET_EXPIRESIN,
   PASSWORD_HISTORY_LIMIT,
 } from "../constants/constant.config.js";
+
+// Utilities
 import ApiError from "../utils/apiError.js";
-import { StatusCodes } from "http-status-codes";
 
 // ==============================
 // Schema Definition
@@ -432,7 +434,9 @@ UserSchema.pre("save", async function (next) {
 
     if (this.isModified("password") && this.password) {
       if (!this.password) {
-        return next(new Error("Password is required"));
+        return next(
+          new ApiError(StatusCodes.BAD_REQUEST, "Password is required")
+        );
       }
 
       // Check password reuse
@@ -581,14 +585,6 @@ UserSchema.methods.registerFailedLogin = async function () {
   await this.save();
 };
 
-UserSchema.methods.checkPasswordReuse = async function (newPassword) {
-  for (const oldPassword of this.passwordHistory) {
-    if (await bcrypt.compare(newPassword, oldPassword)) {
-      throw new Error("Cannot reuse previous passwords");
-    }
-  }
-};
-
 UserSchema.methods.incLoginAttempts = async function () {
   const MAX_ATTEMPTS = 5;
   const BASE_DELAY = 1 * 60 * 1000;
@@ -635,17 +631,6 @@ UserSchema.methods.generateBackupCodes = async function () {
 
   // Return the raw codes for one-time display to user
   return rawCodes;
-};
-
-UserSchema.methods.changedPasswordAfter = function (JWTTimestamp) {
-  if (this.passwordChangedAt) {
-    const changedTimestamp = parseInt(
-      this.passwordChangedAt.getTime() / 1000,
-      10
-    );
-    return JWTTimestamp < changedTimestamp;
-  }
-  return false;
 };
 
 UserSchema.methods.generatePasswordResetToken = function () {
@@ -766,7 +751,6 @@ UserSchema.index(
 // Plugins
 // ==============================
 UserSchema.plugin(softDeletePlugin);
-UserSchema.plugin(sanitize);
 UserSchema.plugin(leanVirtuals);
 UserSchema.plugin(leanGetters);
 

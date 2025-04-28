@@ -28,6 +28,7 @@ import logger from "../logger/winston.logger.js";
 // ------------------------------
 
 const authenticate = asyncHandler(async (req, _, next) => {
+  // Get the token from cookies or headers
   const token =
     req.cookies?.accessToken ||
     req.header("Authorization")?.replace("Bearer ", "");
@@ -38,10 +39,12 @@ const authenticate = asyncHandler(async (req, _, next) => {
   }
 
   try {
+    // Verify the JWT token
     const decoded = jwt.verify(token, JWT_ACCESS_SECRET);
 
+    // Find the user by ID
     const user = await User.findById(decoded._id).select(
-      "-password -tokens.token  -otp"
+      "-password -tokens.token -otp"
     );
 
     if (!user) {
@@ -98,8 +101,10 @@ const authenticate = asyncHandler(async (req, _, next) => {
     req.user = user;
     req.sessionId = decoded.sessionId || null;
 
+    // Move to the next middleware or route handler
     next();
   } catch (error) {
+    // Token expired or invalid token errors
     if (error instanceof jwt.TokenExpiredError) {
       logger.warn("AuthMiddleware: Token expired");
       throw new ApiError(StatusCodes.UNAUTHORIZED, "Token expired");
@@ -109,6 +114,7 @@ const authenticate = asyncHandler(async (req, _, next) => {
       throw new ApiError(StatusCodes.UNAUTHORIZED, "Invalid token");
     }
 
+    // Unexpected error handling
     logger.error(`AuthMiddleware: Unexpected error - ${error.message}`);
     throw new ApiError(StatusCodes.UNAUTHORIZED, "Authentication failed");
   }

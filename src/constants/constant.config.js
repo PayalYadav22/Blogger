@@ -73,7 +73,7 @@ export const TWILIO_AUTH_TOKEN = process.env.TWILIO_AUTH_TOKEN;
 export const TWILIO_PHONE_NUMBER = process.env.TWILIO_PHONE_NUMBER;
 
 // Idle timeout setting (in minutes) for user sessions
-export const IDLE_TIMEOUT_MINUTES = 30;
+export const IDLE_TIMEOUT_MINUTES = 90;
 
 // Limit the number of stored password histories globally (this is duplicated inside SECURITY_CONFIG too)
 export const PASSWORD_HISTORY_LIMIT = 5;
@@ -84,3 +84,5 @@ export const GOOGLE_SECRET_KEY = process.env.GOOGLE_SECRET_KEY;
 
 export const MAX_OTP_ATTEMPTS = 5;
 export const BLOCK_DURATION_MS = 10 * 60 * 1000;
+
+export const BODY_SIZE_LIMIT = "10mb";

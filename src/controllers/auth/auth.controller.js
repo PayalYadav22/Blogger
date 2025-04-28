@@ -94,7 +94,6 @@ const deviceFingerprint = (req) => {
 const AuthController = {
   // Controller: Register a new user
   registerUser: asyncHandler(async (req, res) => {
-    // 1. Extract user details from the request body
     const {
       email,
       userName,
@@ -108,197 +107,128 @@ const AuthController = {
       recaptchaToken,
     } = req.body;
 
-    // 2. Sanitize input data to prevent malicious content
-    const sanitizedEmail = validator.normalizeEmail(email?.toString().trim());
-    const sanitizedUserName = validator.escape(userName?.toString().trim());
-    const sanitizedFullName = validator.escape(fullName?.toString().trim());
-    const sanitizedPhone = validator.escape(phone?.toString().trim());
-    const sanitizedBio = bio ? validator.escape(bio) : "";
-    const sanitizedGender = gender ? validator.escape(gender) : "";
-    const sanitizedDateOfBirth = dateOfBirth
-      ? validator.toDate(dateOfBirth)
-      : null;
-
-    // 3. Validate that required fields are provided
+    // Input validation
     if (
       [
-        sanitizedEmail,
-        sanitizedUserName,
-        sanitizedFullName,
-        sanitizedPhone,
+        email,
+        userName,
+        fullName,
+        phone,
         password,
+        bio,
+        gender,
+        dateOfBirth,
       ].some((field) => !field?.toString().trim())
     ) {
       throw new ApiError(
         StatusCodes.BAD_REQUEST,
-        "Full name, email, username, phone number, and password are required."
+        "Required fields are missing."
       );
     }
 
-    // 4. Validate reCAPTCHA token presence
     if (!recaptchaToken) {
       throw new ApiError(
         StatusCodes.BAD_REQUEST,
-        "reCAPTCHA verification token is missing."
+        "reCAPTCHA token is missing."
       );
     }
 
-    // 5. Start a MongoDB session for atomic operations (transaction)
     const session = await User.startSession();
     session.startTransaction();
-
-    let avatar; // To hold uploaded avatar info
+    let avatar;
 
     try {
-      // 6. Check if avatar image is uploaded
+      // Avatar file check
       const avatarLocalPath = req?.file?.path;
       if (!avatarLocalPath) {
         throw new ApiError(
           StatusCodes.BAD_REQUEST,
-          "Avatar image is required during registration."
+          "Avatar image is required."
         );
       }
 
-      // 7. Upload avatar to Cloudinary
+      // Upload avatar to Cloudinary
       avatar = await uploadFileToCloudinary(avatarLocalPath);
       if (!avatar?.secure_url || !avatar?.public_id) {
-        if (avatar?.public_id) {
-          await deleteFileFromCloudinary(avatar.public_id); // Cleanup partially uploaded file
-        }
-        throw new ApiError(
-          StatusCodes.BAD_REQUEST,
-          "Failed to upload and process profile image."
-        );
+        if (avatar?.public_id) await deleteFileFromCloudinary(avatar.public_id);
+        throw new ApiError(StatusCodes.BAD_REQUEST, "Avatar upload failed.");
       }
 
-      // 8. Check if the user already exists based on email, username, or phone
+      // Check if user already exists
       const existingUser = await User.findOne({
-        $or: [
-          { email: sanitizedEmail },
-          { userName: sanitizedUserName },
-          { phone: sanitizedPhone },
-        ],
+        $or: [{ email }, { userName }, { phone }],
       });
-
       if (existingUser) {
-        if (existingUser.email === sanitizedEmail) {
-          throw new ApiError(StatusCodes.CONFLICT, "Email is already in use.");
-        }
-        if (existingUser.userName === sanitizedUserName) {
+        if (existingUser.email === email)
+          throw new ApiError(StatusCodes.CONFLICT, "Email already in use.");
+        if (existingUser.userName === userName)
+          throw new ApiError(StatusCodes.CONFLICT, "Username already in use.");
+        if (existingUser.phone === phone)
           throw new ApiError(
             StatusCodes.CONFLICT,
-            "Username is already in use."
+            "Phone number already in use."
           );
-        }
-        if (existingUser.phone === sanitizedPhone) {
-          throw new ApiError(
-            StatusCodes.CONFLICT,
-            "Phone number is already in use."
-          );
-        }
       }
 
-      // 9. Generate OTP and expiration time
+      // OTP and expiration
       const otp = generateOTP();
       const otpExpiration = OTP_EXPIRATION_TIME;
 
-      // 10. Verify reCAPTCHA token with Google
-      let recaptchaResponse;
-      try {
-        const { data } = await axios.post(
-          `https://www.google.com/recaptcha/api/siteverify`,
-          new URLSearchParams({
-            secret: GOOGLE_SECRET_KEY,
-            response: recaptchaToken,
-          })
-        );
-        recaptchaResponse = data;
-      } catch (recaptchaError) {
-        logger.error(`reCAPTCHA API request failed: ${recaptchaError.message}`);
-        throw new ApiError(
-          StatusCodes.SERVICE_UNAVAILABLE,
-          "reCAPTCHA verification service is currently unavailable. Please try again later."
-        );
-      }
-
+      // ReCAPTCHA verification
+      const recaptchaResponse = await verifyRecaptcha(recaptchaToken);
       if (!recaptchaResponse?.success) {
-        logger.warn(
-          `reCAPTCHA verification failed: ${
-            recaptchaResponse["error-codes"]?.join(", ") || "Unknown error"
-          }`
-        );
         throw new ApiError(
           StatusCodes.BAD_REQUEST,
-          `reCAPTCHA verification failed: ${
-            recaptchaResponse["error-codes"]?.join(", ") || "Invalid response"
-          }`
+          "Invalid reCAPTCHA response."
         );
       }
 
-      // 11. Create a new user instance
+      // Create user
       const user = new User({
-        fullName: sanitizedFullName,
-        email: sanitizedEmail,
-        userName: sanitizedUserName,
+        fullName,
+        email,
+        userName,
         password,
-        phone: sanitizedPhone,
-        bio: sanitizedBio,
-        gender: sanitizedGender,
-        dateOfBirth: sanitizedDateOfBirth,
-        avatar: {
-          publicId: avatar.public_id,
-          url: avatar.secure_url,
-        },
+        phone,
+        bio,
+        gender,
+        dateOfBirth,
+        avatar: { publicId: avatar.public_id, url: avatar.secure_url },
         socialLinks,
         otp,
         otpExpiration,
-        ...req.body, // In case additional safe fields are included
+        ...req.body,
       });
 
-      // 12. Setup Two-Factor Authentication (2FA) secrets
-      const secret = speakeasy.generateSecret({
-        name: `Blogger (${user.email})`,
-      });
+      // Generate 2FA secret and backup codes
+      const secret = speakeasy.generateSecret({ name: `App (${user.email})` });
       user.scannerSecret = secret.base32;
       user.qrCode = await QRCode.toDataURL(secret.otpauth_url);
 
-      // 13. Generate backup codes for 2FA
       const backupCodes = await user.generateBackupCodes();
 
-      // 14. Save the user into database (within session)
-      await user.save({ session, validateBeforeSave: false });
+      await user.save({ session });
 
-      // 15. Send email verification with OTP
+      // Send verification email
       try {
         await sendEmail({
           to: user.email,
           subject: "Verify Your Email",
           template: "emailVerification",
-          context: {
-            name: user.fullName,
-            otp: otp,
-            expiresIn: OTP_EXPIRATION_TIME,
-          },
+          context: { name: user.fullName, otp, expiresIn: OTP_EXPIRATION_TIME },
         });
       } catch (emailError) {
-        // 16. On email failure, rollback user and avatar
-        if (avatar?.public_id) {
-          await deleteFileFromCloudinary(avatar.public_id);
-        }
+        if (avatar?.public_id) await deleteFileFromCloudinary(avatar.public_id);
         await User.findByIdAndDelete(user._id, { session });
         throw new ApiError(
           StatusCodes.INTERNAL_SERVER_ERROR,
-          "User created but failed to send verification email. Please contact support."
+          "Failed to send verification email."
         );
       }
 
-      // 17. Commit database transaction
       await session.commitTransaction();
       session.endSession();
 
-      logger.info(`User registration successful: ${user.email}`);
-
-      // 18. Send success response
       return new ApiResponse(
         StatusCodes.OK,
         {
@@ -315,20 +245,13 @@ const AuthController = {
           socialLinks: user.socialLinks,
           qrCode: user.qrCode,
         },
-        "Registration successful! Please verify your email to activate your account."
-      ).send(res);
+        "Registration successful! Verify your email."
+      );
     } catch (error) {
-      // 19. Abort transaction if any error occurs
       await session.abortTransaction();
       session.endSession();
-      logger.error(`User registration failed: ${error.message}`);
-
-      // Cleanup avatar if uploaded
-      if (avatar?.public_id) {
-        await deleteFileFromCloudinary(avatar.public_id);
-      }
-
-      throw error; // Pass error to error handler
+      if (avatar?.public_id) await deleteFileFromCloudinary(avatar.public_id);
+      throw error;
     }
   }),
 
