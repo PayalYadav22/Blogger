@@ -1,31 +1,45 @@
 import rateLimit from "express-rate-limit";
 import User from "../models/user.model.js";
 
-const getRateLimit = async (ip) => {
+// Basic limiter instances
+const normalLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 10,
+  message: "Too many requests from this IP, please try again later",
+  skipSuccessfulRequests: true,
+});
+
+const mediumLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 7,
+  message: "Too many requests from this IP, please try again later",
+  skipSuccessfulRequests: true,
+});
+
+const strictLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 5,
+  message: "Too many requests from this IP, please try again later",
+  skipSuccessfulRequests: true,
+});
+
+// Helper to check IP and choose a limiter
+async function selectLimiter(req, res, next) {
+  const ip = req.ip;
   const failedAttempts = await getFailedLoginAttempts(ip);
-  let limit = 10;
 
   if (failedAttempts > 5) {
-    limit = 5;
+    return strictLimiter(req, res, next);
   } else if (failedAttempts > 2) {
-    limit = 7;
+    return mediumLimiter(req, res, next);
+  } else {
+    return normalLimiter(req, res, next);
   }
+}
 
-  return limit;
-};
-
-export const authLimiter = async (req, res, next) => {
-  const ip = req.ip;
-  const maxRequests = await getRateLimit(ip);
-
-  const limiter = rateLimit({
-    windowMs: 15 * 60 * 1000,
-    max: maxRequests,
-    message: "Too many requests from this IP, please try again later",
-    skipSuccessfulRequests: true,
-  });
-
-  limiter(req, res, next);
+// Exported middleware
+export const authLimiter = (req, res, next) => {
+  selectLimiter(req, res, next).catch(next);
 };
 
 async function getFailedLoginAttempts(ip) {
@@ -33,8 +47,22 @@ async function getFailedLoginAttempts(ip) {
   return user ? user.failedLoginAttempts : 0;
 }
 
+// Password reset limiter
 export const passwordResetLimiter = rateLimit({
   windowMs: 60 * 60 * 1000, // 1 hour
   max: 3,
   message: "Too many password reset attempts, please try again later",
+});
+
+// Registration limiter
+export const registerLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 5,
+  message: {
+    status: 429,
+    message:
+      "Too many registration attempts from this IP. Please try again later.",
+  },
+  standardHeaders: true,
+  legacyHeaders: false,
 });

@@ -9,7 +9,10 @@ import cors from "cors";
 import helmet from "helmet";
 import compression from "compression";
 
-import { CORS_ORIGIN } from "../constants/constant.config.js";
+import {
+  CORS_ORIGIN,
+  GOOGLE_SECRET_KEY,
+} from "../constants/constant.config.js";
 import router from "../routes/router.js";
 import errorHandler from "../middleware/errorHandler.error.js";
 import notFound from "../middleware/notFound.middleware.js";

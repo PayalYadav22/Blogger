@@ -22,6 +22,7 @@ import {
   JWT_ACCESS_SECRET_EXPIRESIN,
   JWT_REFRESH_SECRET,
   JWT_REFRESH_SECRET_EXPIRESIN,
+  PASSWORD_HISTORY_LIMIT,
 } from "../constants/constant.config.js";
 import ApiError from "../utils/apiError.js";
 import { StatusCodes } from "http-status-codes";
@@ -139,6 +140,7 @@ const UserSchema = new mongoose.Schema(
         },
       },
     ],
+
     // ------------------------------
     // Profile fields
     // ------------------------------
@@ -433,6 +435,7 @@ UserSchema.pre("save", async function (next) {
         return next(new Error("Password is required"));
       }
 
+      // Check password reuse
       if (this.passwordHistory?.length > 0) {
         const isReused = await Promise.all(
           this.passwordHistory.map(async (oldHash) => {
@@ -450,18 +453,15 @@ UserSchema.pre("save", async function (next) {
         }
       }
 
+      // Hash the new password
       const salt = await bcrypt.genSalt(saltRounds);
       const hash = await bcrypt.hash(this.password, salt);
 
       // Save current password hash into password history
-      if (this.isModified("passwordHistory")) {
-        this.passwordHistory.unshift(hash);
-      } else {
-        this.passwordHistory = [hash, ...(this.passwordHistory || [])];
-      }
-
-      // Keep only last 5 passwords
-      this.passwordHistory = this.passwordHistory.slice(0, 5);
+      this.passwordHistory = [hash, ...(this.passwordHistory || [])].slice(
+        0,
+        PASSWORD_HISTORY_LIMIT
+      ); // keep only the latest N
 
       // Save new hashed password
       this.password = hash;
@@ -469,6 +469,8 @@ UserSchema.pre("save", async function (next) {
       // Update lastPasswordChange timestamp
       this.lastPasswordChange = new Date();
     }
+
+    // Hash OTP if it changed
     if (this.isModified("otp") && this.otp) {
       const salt = await bcrypt.genSalt(saltRounds);
       const hash = await bcrypt.hash(this.otp, salt);
@@ -614,13 +616,25 @@ UserSchema.methods.resetLoginState = function (ip, device) {
 };
 
 UserSchema.methods.generateBackupCodes = async function () {
-  const codes = Array(5)
+  // Generate 5 random backup codes (unhashed for display to user)
+  const rawCodes = Array(5)
     .fill()
-    .map(async () => ({
-      code: await bcrypt.hash(crypto.randomBytes(8).toString("hex"), 10),
+    .map(() => crypto.randomBytes(8).toString("hex"));
+
+  // Hash the codes for secure storage
+  const hashedCodes = await Promise.all(
+    rawCodes.map(async (code) => ({
+      code: await bcrypt.hash(code, 10),
       used: false,
-    }));
-  this.backupCodes = codes;
+      createdAt: new Date(),
+    }))
+  );
+
+  // Store both raw (for one-time display) and hashed versions
+  this.backupCodes = hashedCodes;
+
+  // Return the raw codes for one-time display to user
+  return rawCodes;
 };
 
 UserSchema.methods.changedPasswordAfter = function (JWTTimestamp) {
@@ -670,6 +684,30 @@ UserSchema.statics.authenticateToken = async function (token) {
   }
 };
 
+UserSchema.statics.cleanupExpiredTokens = async function () {
+  const now = new Date();
+
+  const accessTokenLifetimeMs = 2 * 60 * 60 * 1000;
+  const accessTokenExpirationThreshold = new Date(
+    now.getTime() - accessTokenLifetimeMs
+  );
+
+  await this.updateMany(
+    {
+      $or: [
+        { "refreshTokens.expiresAt": { $lt: now } },
+        { "tokens.createdAt": { $lt: accessTokenExpirationThreshold } },
+      ],
+    },
+    {
+      $pull: {
+        refreshTokens: { expiresAt: { $lt: now } },
+        tokens: { createdAt: { $lt: accessTokenExpirationThreshold } },
+      },
+    }
+  );
+};
+
 // ==============================
 // Virtual Fields
 // ==============================
@@ -691,6 +729,13 @@ UserSchema.virtual("isLocked").get(function () {
   return !!(this.lockUntil && this.lockUntil > Date.now());
 });
 
+UserSchema.virtual("age").get(function () {
+  if (!this.dateOfBirth) return null;
+  const diff = Date.now() - this.dateOfBirth.getTime();
+  const age = new Date(diff).getUTCFullYear() - 1970;
+  return age;
+});
+
 // ==============================
 // Virtual Fields in Json
 // ==============================
@@ -700,21 +745,11 @@ UserSchema.set("toJSON", { virtuals: true });
 // ==============================
 // Indexes
 // ==============================
-UserSchema.index({ "tokens.token": 1 });
-UserSchema.index({ isEmailVerified: 1 });
-UserSchema.index({ failedLoginAttempts: 1 });
 UserSchema.index({ fullName: "text", userName: "text", bio: "text" });
 UserSchema.index({ role: 1, isEmailVerified: 1 });
-UserSchema.index({ isActive: 1, isSuspended: 1 });
-UserSchema.index({ "refreshTokens.token": 1 });
+UserSchema.index({ isActive: 1, isSuspended: 1, role: 1, isEmailVerified: 1 });
 UserSchema.index({ subscriptionTier: 1 });
 UserSchema.index({ popularityScore: -1 });
-UserSchema.index({
-  isActive: 1,
-  isSuspended: 1,
-  role: 1,
-  isEmailVerified: 1,
-});
 UserSchema.index({
   followersCount: -1,
   popularityScore: -1,

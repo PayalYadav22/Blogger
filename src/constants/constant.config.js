@@ -20,7 +20,7 @@ export const EMAIL_PASSWORD = process.env.EMAIL_PASSWORD;
 export const SALT_ROUND = 12;
 
 // OTP expiration time; time in milliseconds (5 minutes)
-export const OTP_EXPIRATION_TIME = 5 * 60 * 1000;
+export const OTP_EXPIRATION_TIME = new Date(Date.now() + 15 * 60 * 1000);
 
 // Security-related configuration
 export const SECURITY_CONFIG = {
@@ -39,30 +39,48 @@ export const SECURITY_CONFIG = {
   // Limit the number of stored previous passwords to avoid excessive data retention
   PASSWORD_HISTORY_LIMIT: 5,
 
-  // Prevent reusing the same password for the specified cooldown period (1 year)
-  PASSWORD_REUSE_COOLDOWN: 365 * 24 * 60 * 60 * 1000, // 1 year in milliseconds
+  // Prevent reusing the same password for the specified cooldown period (1 year in milliseconds)
+  PASSWORD_REUSE_COOLDOWN: 365 * 24 * 60 * 60 * 1000,
 };
 
-// Cloudinary API credentials
+// Cloudinary API credentials; used for media storage (avatars, images)
 export const CLOUDINARY_API_KEY = process.env.CLOUDINARY_API_KEY;
 export const CLOUDINARY_NAME = process.env.CLOUDINARY_NAME;
 export const CLOUDINARY_API_SECRET = process.env.CLOUDINARY_API_SECRET;
 
+// Cookie options for authentication tokens (e.g., refresh tokens)
 export const OPTIONS = {
-  httpOnly: true,
-  secure: process.env.NODE_ENV === "production",
-  sameSite: "strict",
-  maxAge: 24 * 60 * 60 * 1000,
+  httpOnly: true, // Cookie not accessible via JavaScript (mitigates XSS)
+  secure: process.env.NODE_ENV === "production", // Only HTTPS in production
+  sameSite: "strict", // No cross-site cookie sharing
+  maxAge: 24 * 60 * 60 * 1000, // 1 day
 };
 
+// JWT (JSON Web Token) secrets and expiration times
 export const JWT_ACCESS_SECRET = process.env.JWT_ACCESS_SECRET;
 export const JWT_ACCESS_SECRET_EXPIRESIN =
   process.env.JWT_ACCESS_SECRET_EXPIRESIN;
 export const JWT_REFRESH_SECRET = process.env.JWT_REFRESH_SECRET;
 export const JWT_REFRESH_SECRET_EXPIRESIN =
   process.env.JWT_REFRESH_SECRET_EXPIRESIN;
+
+// Base URL for client application (frontend); needed for CORS, redirects, etc.
 export const CLIENT_BASE_URL = process.env.CLIENT_BASE_URL;
+
+// Twilio credentials; used for sending OTPs via SMS
 export const TWILIO_ACCOUNT_SID = process.env.TWILIO_ACCOUNT_SID;
 export const TWILIO_AUTH_TOKEN = process.env.TWILIO_AUTH_TOKEN;
 export const TWILIO_PHONE_NUMBER = process.env.TWILIO_PHONE_NUMBER;
+
+// Idle timeout setting (in minutes) for user sessions
 export const IDLE_TIMEOUT_MINUTES = 30;
+
+// Limit the number of stored password histories globally (this is duplicated inside SECURITY_CONFIG too)
+export const PASSWORD_HISTORY_LIMIT = 5;
+
+// Google reCAPTCHA credentials; used for bot protection
+export const GOOGLE_SITE_KEY = process.env.GOOGLE_SITE_KEY;
+export const GOOGLE_SECRET_KEY = process.env.GOOGLE_SECRET_KEY;
+
+export const MAX_OTP_ATTEMPTS = 5;
+export const BLOCK_DURATION_MS = 10 * 60 * 1000;

@@ -4,6 +4,8 @@ import speakeasy from "speakeasy";
 import QRCode from "qrcode";
 import * as UAParser from "ua-parser-js";
 import { StatusCodes } from "http-status-codes";
+import axios from "axios";
+import validator from "validator";
 
 // Models
 import User from "../../models/user.model.js";
@@ -15,16 +17,26 @@ import {
 } from "../../config/cloudinary.config.js";
 
 // Constants
-import { OPTIONS } from "../../constants/constant.config.js";
+import {
+  OPTIONS,
+  GOOGLE_SECRET_KEY,
+  OTP_EXPIRATION_TIME,
+  MAX_OTP_ATTEMPTS,
+  BLOCK_DURATION_MS,
+} from "../../constants/constant.config.js";
 
 // Middleware
 import asyncHandler from "../../middleware/asyncHandler.middleware.js";
+
+// Logger
+import logger from "../../logger/winston.logger.js";
 
 // Utilities
 import ApiError from "../../utils/apiError.js";
 import ApiResponse from "../../utils/apiResponse.js";
 import generateOTP from "../../utils/otp.js";
 import sendEmail from "../../utils/email.js";
+import Api from "twilio/lib/rest/Api.js";
 
 const generateTokens = async (id, ip, device, deviceFingerprint, req) => {
   try {
@@ -80,9 +92,9 @@ const deviceFingerprint = (req) => {
 };
 
 const AuthController = {
-  // Controller to handle new user registration
+  // Controller: Register a new user
   registerUser: asyncHandler(async (req, res) => {
-    // Step 1: Extract required fields from the request body
+    // 1. Extract user details from the request body
     const {
       email,
       userName,
@@ -93,13 +105,29 @@ const AuthController = {
       gender,
       dateOfBirth,
       socialLinks,
+      recaptchaToken,
     } = req.body;
 
-    // Step 2: Basic validation - Ensure all mandatory fields are present
+    // 2. Sanitize input data to prevent malicious content
+    const sanitizedEmail = validator.normalizeEmail(email?.toString().trim());
+    const sanitizedUserName = validator.escape(userName?.toString().trim());
+    const sanitizedFullName = validator.escape(fullName?.toString().trim());
+    const sanitizedPhone = validator.escape(phone?.toString().trim());
+    const sanitizedBio = bio ? validator.escape(bio) : "";
+    const sanitizedGender = gender ? validator.escape(gender) : "";
+    const sanitizedDateOfBirth = dateOfBirth
+      ? validator.toDate(dateOfBirth)
+      : null;
+
+    // 3. Validate that required fields are provided
     if (
-      [email, userName, fullName, phone, password].some(
-        (field) => !field?.toString().trim()
-      )
+      [
+        sanitizedEmail,
+        sanitizedUserName,
+        sanitizedFullName,
+        sanitizedPhone,
+        password,
+      ].some((field) => !field?.toString().trim())
     ) {
       throw new ApiError(
         StatusCodes.BAD_REQUEST,
@@ -107,130 +135,208 @@ const AuthController = {
       );
     }
 
-    // Step 3: Check for duplicates - Prevent registration with existing email/username/phone
-    const existingUser = await User.findOne({
-      $or: [{ email }, { userName }, { phone }],
-    });
-    if (existingUser) {
-      throw new ApiError(
-        StatusCodes.CONFLICT,
-        "A user with the provided email, username, or phone number already exists."
-      );
-    }
-
-    // Step 4: Avatar handling - Validate and upload user profile picture
-    const avatarLocalPath = req?.file?.path;
-    if (!avatarLocalPath) {
+    // 4. Validate reCAPTCHA token presence
+    if (!recaptchaToken) {
       throw new ApiError(
         StatusCodes.BAD_REQUEST,
-        "Avatar image is required during registration."
+        "reCAPTCHA verification token is missing."
       );
     }
 
-    const avatar = await uploadFileToCloudinary(avatarLocalPath);
-    if (!avatar?.secure_url || !avatar?.public_id) {
-      if (avatar?.public_id) await deleteFileFromCloudinary(avatar.public_id);
-      throw new ApiError(
-        StatusCodes.BAD_REQUEST,
-        "Failed to upload and process profile image."
-      );
-    }
+    // 5. Start a MongoDB session for atomic operations (transaction)
+    const session = await User.startSession();
+    session.startTransaction();
 
-    // Step 5: Prepare user data - Generate OTP for email verification
-    const otp = generateOTP();
-    const otpExpiration = new Date(Date.now() + 10 * 60 * 1000); // 10 minutes from now
+    let avatar; // To hold uploaded avatar info
 
-    // Step 6: Create user in the database
-    const user = await User.create({
-      fullName,
-      email,
-      userName,
-      password,
-      phone,
-      bio,
-      gender,
-      dateOfBirth,
-      avatar: {
-        publicId: avatar.public_id,
-        url: avatar.secure_url,
-      },
-      socialLinks,
-      otp,
-      otpExpiration,
-      ...req.body, // (Optional) Spread additional allowed fields
-    });
-
-    if (!user) {
-      await deleteFileFromCloudinary(avatar.public_id);
-      throw new ApiError(
-        StatusCodes.INTERNAL_SERVER_ERROR,
-        "Failed to create user. Please try again later."
-      );
-    }
-
-    // Step 7: Set up Two-Factor Authentication (2FA) for enhanced security
-    const secret = speakeasy.generateSecret({
-      name: `Blogger (${user.email})`,
-    });
-    user.scannerSecret = secret.base32;
-    user.qrCode = await QRCode.toDataURL(secret.otpauth_url);
-
-    // Step 8: Generate backup codes for 2FA recovery
-    user.generateBackupCodes();
-
-    // Save user updates (2FA secret and codes) without re-triggering all validations
-    await user.save({ validateBeforeSave: false });
-
-    // Step 9: Send OTP verification email
     try {
-      await sendEmail({
-        to: user.email,
-        subject: "Verify Your Email",
-        template: "emailVerification",
-        context: {
-          name: user.fullName,
-          otp: otp,
-          expiresIn: "10 minutes",
-        },
-      });
-    } catch (error) {
-      // Rollback - Delete avatar and user if email fails
-      await Promise.all([
-        deleteFileFromCloudinary(user.avatar.publicId),
-        User.findByIdAndDelete(user._id),
-      ]);
-      throw new ApiError(
-        StatusCodes.INTERNAL_SERVER_ERROR,
-        "User created but failed to send verification email. Please contact support."
-      );
-    }
+      // 6. Check if avatar image is uploaded
+      const avatarLocalPath = req?.file?.path;
+      if (!avatarLocalPath) {
+        throw new ApiError(
+          StatusCodes.BAD_REQUEST,
+          "Avatar image is required during registration."
+        );
+      }
 
-    // Step 10: Respond with user details (excluding sensitive info)
-    return new ApiResponse(
-      StatusCodes.OK,
-      {
-        userId: user._id,
-        fullName: user.fullName,
-        userName: user.userName,
-        email: user.email,
-        avatar: user.avatar?.url,
-        phone: user.phone,
-        gender: user.gender,
-        dateOfBirth: user.dateOfBirth,
-        bio: user.bio,
-        role: user.role,
-        socialLinks: user.socialLinks,
-        qrCode: user.qrCode, // Frontend will display this for 2FA setup
-      },
-      "Registration successful! Please verify your email to activate your account."
-    ).send(res);
+      // 7. Upload avatar to Cloudinary
+      avatar = await uploadFileToCloudinary(avatarLocalPath);
+      if (!avatar?.secure_url || !avatar?.public_id) {
+        if (avatar?.public_id) {
+          await deleteFileFromCloudinary(avatar.public_id); // Cleanup partially uploaded file
+        }
+        throw new ApiError(
+          StatusCodes.BAD_REQUEST,
+          "Failed to upload and process profile image."
+        );
+      }
+
+      // 8. Check if the user already exists based on email, username, or phone
+      const existingUser = await User.findOne({
+        $or: [
+          { email: sanitizedEmail },
+          { userName: sanitizedUserName },
+          { phone: sanitizedPhone },
+        ],
+      });
+
+      if (existingUser) {
+        if (existingUser.email === sanitizedEmail) {
+          throw new ApiError(StatusCodes.CONFLICT, "Email is already in use.");
+        }
+        if (existingUser.userName === sanitizedUserName) {
+          throw new ApiError(
+            StatusCodes.CONFLICT,
+            "Username is already in use."
+          );
+        }
+        if (existingUser.phone === sanitizedPhone) {
+          throw new ApiError(
+            StatusCodes.CONFLICT,
+            "Phone number is already in use."
+          );
+        }
+      }
+
+      // 9. Generate OTP and expiration time
+      const otp = generateOTP();
+      const otpExpiration = OTP_EXPIRATION_TIME;
+
+      // 10. Verify reCAPTCHA token with Google
+      let recaptchaResponse;
+      try {
+        const { data } = await axios.post(
+          `https://www.google.com/recaptcha/api/siteverify`,
+          new URLSearchParams({
+            secret: GOOGLE_SECRET_KEY,
+            response: recaptchaToken,
+          })
+        );
+        recaptchaResponse = data;
+      } catch (recaptchaError) {
+        logger.error(`reCAPTCHA API request failed: ${recaptchaError.message}`);
+        throw new ApiError(
+          StatusCodes.SERVICE_UNAVAILABLE,
+          "reCAPTCHA verification service is currently unavailable. Please try again later."
+        );
+      }
+
+      if (!recaptchaResponse?.success) {
+        logger.warn(
+          `reCAPTCHA verification failed: ${
+            recaptchaResponse["error-codes"]?.join(", ") || "Unknown error"
+          }`
+        );
+        throw new ApiError(
+          StatusCodes.BAD_REQUEST,
+          `reCAPTCHA verification failed: ${
+            recaptchaResponse["error-codes"]?.join(", ") || "Invalid response"
+          }`
+        );
+      }
+
+      // 11. Create a new user instance
+      const user = new User({
+        fullName: sanitizedFullName,
+        email: sanitizedEmail,
+        userName: sanitizedUserName,
+        password,
+        phone: sanitizedPhone,
+        bio: sanitizedBio,
+        gender: sanitizedGender,
+        dateOfBirth: sanitizedDateOfBirth,
+        avatar: {
+          publicId: avatar.public_id,
+          url: avatar.secure_url,
+        },
+        socialLinks,
+        otp,
+        otpExpiration,
+        ...req.body, // In case additional safe fields are included
+      });
+
+      // 12. Setup Two-Factor Authentication (2FA) secrets
+      const secret = speakeasy.generateSecret({
+        name: `Blogger (${user.email})`,
+      });
+      user.scannerSecret = secret.base32;
+      user.qrCode = await QRCode.toDataURL(secret.otpauth_url);
+
+      // 13. Generate backup codes for 2FA
+      const backupCodes = await user.generateBackupCodes();
+
+      // 14. Save the user into database (within session)
+      await user.save({ session, validateBeforeSave: false });
+
+      // 15. Send email verification with OTP
+      try {
+        await sendEmail({
+          to: user.email,
+          subject: "Verify Your Email",
+          template: "emailVerification",
+          context: {
+            name: user.fullName,
+            otp: otp,
+            expiresIn: OTP_EXPIRATION_TIME,
+          },
+        });
+      } catch (emailError) {
+        // 16. On email failure, rollback user and avatar
+        if (avatar?.public_id) {
+          await deleteFileFromCloudinary(avatar.public_id);
+        }
+        await User.findByIdAndDelete(user._id, { session });
+        throw new ApiError(
+          StatusCodes.INTERNAL_SERVER_ERROR,
+          "User created but failed to send verification email. Please contact support."
+        );
+      }
+
+      // 17. Commit database transaction
+      await session.commitTransaction();
+      session.endSession();
+
+      logger.info(`User registration successful: ${user.email}`);
+
+      // 18. Send success response
+      return new ApiResponse(
+        StatusCodes.OK,
+        {
+          userId: user._id,
+          fullName: user.fullName,
+          userName: user.userName,
+          email: user.email,
+          avatar: user.avatar?.url,
+          phone: user.phone,
+          gender: user.gender,
+          dateOfBirth: user.dateOfBirth,
+          bio: user.bio,
+          role: user.role,
+          socialLinks: user.socialLinks,
+          qrCode: user.qrCode,
+        },
+        "Registration successful! Please verify your email to activate your account."
+      ).send(res);
+    } catch (error) {
+      // 19. Abort transaction if any error occurs
+      await session.abortTransaction();
+      session.endSession();
+      logger.error(`User registration failed: ${error.message}`);
+
+      // Cleanup avatar if uploaded
+      if (avatar?.public_id) {
+        await deleteFileFromCloudinary(avatar.public_id);
+      }
+
+      throw error; // Pass error to error handler
+    }
   }),
 
-  // Controller to verify user's email with OTP
+  // Controller: Verify Email using OTP
   verifyEmail: asyncHandler(async (req, res) => {
     const { email, otp } = req.body;
 
-    // Step 1: Basic input validation
+    // 1. Validate required fields
     if (!email || !otp) {
       throw new ApiError(
         StatusCodes.BAD_REQUEST,
@@ -238,13 +344,13 @@ const AuthController = {
       );
     }
 
-    // Step 2: Fetch user by email and check OTP eligibility
+    // 2. Find the user by email with unexpired OTP and not yet verified
     const user = await User.findOne({
       email,
       otp: { $exists: true },
-      otpExpiration: { $gt: Date.now() }, // OTP must not be expired
-      isEmailVerified: false, // Only allow unverified users
-    }).select("+password +otp +otpExpiration +otpAttempts +otpBlockedUntil"); // Explicitly select protected fields
+      otpExpiration: { $gt: Date.now() },
+      isEmailVerified: false,
+    }).select("+password +otp +otpExpiration +otpAttempts +otpBlockedUntil");
 
     if (!user) {
       throw new ApiError(
@@ -253,52 +359,59 @@ const AuthController = {
       );
     }
 
-    // Step 3: Check if user is currently blocked due to too many failed attempts
+    // 3. Check if user is temporarily blocked due to too many failed attempts
     if (user.otpBlockedUntil && user.otpBlockedUntil > Date.now()) {
-      const remainingMinutes = Math.ceil(
-        (user.otpBlockedUntil - Date.now()) / (60 * 1000)
-      );
       throw new ApiError(
         StatusCodes.TOO_MANY_REQUESTS,
-        `Too many failed attempts. Please try again in ${remainingMinutes} minute(s).`
+        "Too many failed attempts. Please try again later."
       );
     }
 
-    // Step 4: Validate the provided OTP against user's stored OTP
-    const isValid = await user.compareOTP(otp);
-
-    if (!isValid) {
-      // Step 4a: Handle incorrect OTP attempt
-      user.otpAttempts += 1;
-
-      // Block user if failed attempts exceed limit
-      if (user.otpAttempts >= 5) {
-        user.otpBlockedUntil = new Date(Date.now() + 10 * 60 * 1000); // Block for 10 minutes
-      }
-
-      await user.save({ validateBeforeSave: false });
-
-      const attemptsLeft = Math.max(0, 5 - user.otpAttempts);
-
-      throw new ApiError(
-        StatusCodes.BAD_REQUEST,
-        attemptsLeft > 0
-          ? `Incorrect OTP. You have ${attemptsLeft} attempt(s) left.`
-          : "Too many incorrect attempts. Please try again after 10 minutes."
-      );
-    }
-
-    // Step 5: Begin transaction to verify email safely
+    // 4. Start a transaction session
     const session = await mongoose.startSession();
+    let transactionActive = false;
 
     try {
       session.startTransaction();
+      transactionActive = true;
 
-      // Mark email as verified
+      // 5. Compare submitted OTP with stored OTP
+      const isValid = await user.compareOTP(otp);
+
+      if (!isValid) {
+        // 6. Increment failed attempts if OTP is invalid
+        user.otpAttempts += 1;
+
+        // 7. If max attempts exceeded, block further attempts temporarily
+        if (user.otpAttempts >= MAX_OTP_ATTEMPTS) {
+          user.otpBlockedUntil = new Date(Date.now() + BLOCK_DURATION_MS);
+        }
+
+        await user.save({ validateBeforeSave: false, session });
+
+        // 8. Commit the session even if OTP was incorrect
+        await session.commitTransaction();
+        transactionActive = false;
+        session.endSession();
+
+        // 9. Handle response after too many wrong attempts
+        if (user.otpBlockedUntil) {
+          throw new ApiError(
+            StatusCodes.TOO_MANY_REQUESTS,
+            "Too many incorrect attempts. Please try again later."
+          );
+        } else {
+          const attemptsLeft = MAX_OTP_ATTEMPTS - user.otpAttempts;
+          throw new ApiError(
+            StatusCodes.BAD_REQUEST,
+            `Incorrect OTP. You have ${attemptsLeft} attempt(s) left.`
+          );
+        }
+      }
+
+      // 10. OTP is valid - Update user's verification status
       user.isEmailVerified = true;
       user.emailVerifiedAt = new Date();
-
-      // Step 5a: Cleanup sensitive OTP fields
       user.otp = undefined;
       user.otpExpiration = undefined;
       user.otpAttempts = 0;
@@ -306,48 +419,65 @@ const AuthController = {
       user.emailVerificationToken = undefined;
       user.emailVerificationTokenExpiration = undefined;
 
-      // Save the user within transaction
-      await user.save({ session });
+      // 11. Record security log
+      user.securityLogs.push({
+        action: "email_verified",
+        ip: req.ip,
+        userAgent: req.headers["user-agent"],
+      });
 
-      // Step 6: Commit transaction after successful save
+      // 12. Save updated user
+      await user.save({ validateBeforeSave: false, session });
+
+      // 13. Commit and end the transaction
       await session.commitTransaction();
+      transactionActive = false;
+      session.endSession();
 
-      // Step 7: Respond with success
+      // 14. Send success response
       return new ApiResponse(
         StatusCodes.OK,
         { isEmailVerified: true },
         "Your email has been successfully verified."
       ).send(res);
     } catch (error) {
-      // Step 8: Abort transaction in case of any error
-      await session.abortTransaction();
+      // 15. Rollback transaction if error occurred
+      if (transactionActive) {
+        try {
+          await session.abortTransaction();
+        } catch (abortError) {
+          console.error("Abort transaction failed:", abortError.message);
+        }
+      }
+      session.endSession();
 
-      // Log error details for debugging
-      console.error("Error during email verification session:", error);
+      // 16. Log error details
+      logger.error("Error during email verification session:", {
+        error: error.message,
+        email: user?.email,
+        userId: user?._id,
+        ip: req.ip,
+        userAgent: req.headers["user-agent"],
+      });
+
+      // 17. Re-throw the error appropriately
+      if (error instanceof ApiError) {
+        throw error;
+      }
 
       throw new ApiError(
         StatusCodes.INTERNAL_SERVER_ERROR,
         "Something went wrong during verification. Please try again."
       );
-    } finally {
-      // Step 9: Always end session
-      session.endSession();
     }
   }),
 
   // Controller to log in a user
   loginUser: asyncHandler(async (req, res) => {
-    const {
-      email,
-      userName,
-      phone,
-      password,
-      screenResolution,
-      timezone,
-      language,
-    } = req.body;
+    // Destructure necessary fields from the request body
+    const { email, userName, phone, password } = req.body;
 
-    // Step 1: Validate input - require password and at least one identifier
+    // Step 1: Validate input - require password and at least one identifier (email, username, or phone)
     if (!password || (!email && !userName && !phone)) {
       throw new ApiError(
         StatusCodes.BAD_REQUEST,
@@ -355,7 +485,7 @@ const AuthController = {
       );
     }
 
-    // Step 2: Find user by email, username, or phone
+    // Step 2: Find user by email, username, or phone (case-insensitive)
     const user = await User.findOne({
       $or: [{ email }, { userName }, { phone }],
     }).select(
@@ -364,21 +494,21 @@ const AuthController = {
 
     // Step 3: Handle user not found - add delay to mitigate user enumeration attacks
     if (!user) {
-      await new Promise((resolve) => setTimeout(resolve, 500));
+      await new Promise((resolve) => setTimeout(resolve, 500)); // Adding delay
       throw new ApiError(StatusCodes.UNAUTHORIZED, "Invalid credentials.");
     }
 
-    // Step 4: Validate the provided password
+    // Step 4: Validate the provided password (compare hashed password with input)
     const isValid = await user.comparePassword(password);
 
     if (!isValid) {
-      // Step 4a: Register failed attempt and delay response
-      await user.registerFailedLogin();
-      await new Promise((resolve) => setTimeout(resolve, 500));
+      // Step 4a: Register failed attempt and add delay response to mitigate brute force
+      await user.registerFailedLogin(); // Increment failed login attempts
+      await new Promise((resolve) => setTimeout(resolve, 500)); // Adding delay
       throw new ApiError(StatusCodes.UNAUTHORIZED, "Invalid credentials.");
     }
 
-    // Step 5: Check account status flags
+    // Step 5: Check account status flags (active, suspended, verified)
     if (!user.isActive) {
       throw new ApiError(
         StatusCodes.FORBIDDEN,
@@ -411,7 +541,7 @@ const AuthController = {
       );
     }
 
-    // Step 7: Parse device/browser info for session tracking
+    // Step 7: Parse device/browser info for session tracking (fingerprint to track sessions)
     const Fingerprint = deviceFingerprint(req);
 
     // Step 8: Generate access and refresh tokens
@@ -423,14 +553,15 @@ const AuthController = {
       req
     );
 
-    // Step 9: Reset login attempts and log new session
+    // Step 9: Reset login attempts and log new session in the database
     await User.findByIdAndUpdate(
       user._id,
       {
         $set: {
-          loginAttempts: 0,
-          lockUntil: undefined,
+          loginAttempts: 0, // Reset failed login attempts
+          lockUntil: undefined, // Unlock the account if previously locked
           lastLogin: {
+            // Log the new login details
             ip: req.ip,
             device: req.headers["user-agent"],
             timestamp: new Date(),
@@ -438,22 +569,23 @@ const AuthController = {
         },
         $push: {
           sessions: {
+            // Push session details to the `sessions` array
             ipAddress: req.ip,
             userAgent: req.headers["user-agent"],
-            deviceFingerprint,
-            createdAt: new Date(),
+            deviceFingerprint: Fingerprint, // Store device fingerprint
+            createdAt: new Date(), // Store timestamp of the session
           },
         },
       },
-      { validateBeforeSave: false, new: true }
+      { validateBeforeSave: false, new: true } // Avoid validation before saving and return the updated user document
     );
 
-    // Step 10: Set secure, HTTP-only cookies for tokens
+    // Step 10: Set secure, HTTP-only cookies for the tokens (to maintain the user session)
     res
-      .cookie("accessToken", accessToken, OPTIONS)
-      .cookie("refreshToken", refreshToken, OPTIONS);
+      .cookie("accessToken", accessToken, OPTIONS) // Set access token cookie
+      .cookie("refreshToken", refreshToken, OPTIONS); // Set refresh token cookie
 
-    // Step 11: Send successful login response with minimal safe user info
+    // Step 11: Send successful login response with minimal safe user info (to avoid overexposure)
     return new ApiResponse(
       StatusCodes.OK,
       {
@@ -470,18 +602,19 @@ const AuthController = {
         socialLinks: user.socialLinks,
         tokens: {
           accessToken,
-          refreshToken,
+          refreshToken, // Include the generated tokens
         },
       },
-      "Login successful. Welcome back!"
+      "Login successful. Welcome back!" // Success message
     ).send(res);
   }),
 
   // Controller for QR Code-based Login for User
   loginQrBaseUser: asyncHandler(async (req, res) => {
+    // Step 1: Extract email and token from the request body
     const { email, token } = req.body;
 
-    // Validate input
+    // Step 2: Validate required input fields
     if (!email || !token) {
       throw new ApiError(
         StatusCodes.BAD_REQUEST,
@@ -489,12 +622,12 @@ const AuthController = {
       );
     }
 
-    // Fetch user and sensitive fields (scannerSecret, otp, otpExpiration)
+    // Step 3: Fetch user by email, selecting sensitive 2FA fields
     const user = await User.findOne({ email }).select(
       "+scannerSecret +otp +otpExpiration"
     );
 
-    // Check if user exists and has 2FA setup
+    // Step 4: Ensure user exists and has set up 2FA scanner
     if (!user || !user.scannerSecret) {
       throw new ApiError(
         StatusCodes.NOT_FOUND,
@@ -502,28 +635,31 @@ const AuthController = {
       );
     }
 
-    // Verify the provided token with user's scannerSecret
+    // Step 5: Verify the provided token against the user's scanner secret
     const isVerified = speakeasy.totp.verify({
       secret: user.scannerSecret,
       encoding: "base32",
       token,
-      window: 1, // allow 1 step window before/after
+      window: 1, // Allow a 1-step time window before/after
     });
 
-    // If token verification fails
+    // Step 6: If token verification fails, throw an unauthorized error
     if (!isVerified) {
       throw new ApiError(StatusCodes.UNAUTHORIZED, "Invalid or expired token.");
     }
 
+    // Step 7: If token verification succeeds, proceed with login
     try {
-      // Reset login-related fields
+      // Step 7.1: Reset login-related fields (loginAttempts, lockout, etc.)
       user.resetLoginState(req.ip, req.headers["user-agent"]);
 
-      // Save updated user state
+      // Step 7.2: Save updated user state to the database
       await user.save({ validateBeforeSave: false });
 
-      // Generate access and refresh tokens
+      // Step 7.3: Generate device fingerprint for session tracking
       const Fingerprint = deviceFingerprint(req);
+
+      // Step 7.4: Issue new access and refresh tokens for the user
       const { accessToken, refreshToken } = await generateTokens(
         user._id,
         req.ip,
@@ -532,11 +668,11 @@ const AuthController = {
         req
       );
 
-      // Set tokens in secure cookies
+      // Step 8: Set the generated tokens into secure HTTP-only cookies
       res.cookie("accessToken", accessToken, OPTIONS);
       res.cookie("refreshToken", refreshToken, OPTIONS);
 
-      // Respond with user profile and tokens
+      // Step 9: Respond with user profile details and new tokens
       return new ApiResponse(
         StatusCodes.OK,
         {
@@ -559,6 +695,7 @@ const AuthController = {
         "Authentication successful. You are now logged in."
       ).send(res);
     } catch (error) {
+      // Step 10: Handle unexpected errors during login process
       console.error("Login error:", error);
       throw new ApiError(StatusCodes.INTERNAL_SERVER_ERROR, "Failed to login.");
     }
@@ -568,57 +705,87 @@ const AuthController = {
   forgotPassword: asyncHandler(async (req, res) => {
     const { email } = req.body;
 
-    // Check if email is provided in the request body
+    // Step 1: Validate that email is provided in the request body
+    // Check if email is provided; if not, throw an error
     if (!email) {
       throw new ApiError(StatusCodes.BAD_REQUEST, "Email is required.");
     }
 
-    // Find user by email, including the OTP and OTP expiration fields
-    const user = await User.findOne({ email }).select("+otp +otpExpiration");
+    // Step 2: Start a Mongoose session for transaction handling
+    // Start a session to ensure that all database changes are executed in a transaction
+    const session = await mongoose.startSession();
+    session.startTransaction();
 
-    // If user is not found, throw an error
-    if (!user) {
-      throw new ApiError(StatusCodes.NOT_FOUND, "User not found.");
+    try {
+      // Step 3: Find the user by email, and select necessary fields (OTP and OTP expiration)
+      // Look for a user with the provided email and include OTP-related fields to update them later
+      const user = await User.findOne({ email })
+        .select("+otp +otpExpiration") // Ensure the OTP fields are selected
+        .session(session); // Link the session to the query to ensure transaction consistency
+
+      // Step 4: Handle case where no user is found with the given email
+      // If user is not found, throw a 'Not Found' error
+      if (!user) {
+        throw new ApiError(StatusCodes.NOT_FOUND, "User not found.");
+      }
+
+      // Step 5: Generate password reset token and OTP for the user
+      // Create a new password reset token and generate an OTP (One-Time Password)
+      const resetToken = user.generatePasswordResetToken(); // Generate the reset token
+      const otp = generateOTP(); // Call function to generate the OTP
+      const otpExpiration = OTP_EXPIRATION_TIME; // Set OTP expiration to 15 minutes from now
+
+      // Step 6: Assign the generated OTP and reset token to the user
+      // Save the generated OTP, OTP expiration, and reset token along with its expiration
+      user.otp = otp;
+      user.otpExpiration = otpExpiration;
+      user.passwordResetToken = resetToken;
+      user.passwordResetTokenExpiration = OTP_EXPIRATION_TIME; // Expiration time for reset token (15 minutes)
+
+      // Step 7: Save the updated user document within the session
+      // Save the updated user data (OTP, reset token, etc.) in the session
+      await user.save({ validateBeforeSave: false, session });
+
+      // Step 8: Generate the password reset URL with the reset token
+      // Construct the password reset URL that the user will use to reset their password
+      const resetUrl = `http://localhost:3000/api/v1/auth/reset-password/${resetToken}`;
+
+      // Step 9: Send the password reset email to the user with OTP and reset URL
+      // Send an email to the user containing the OTP and the reset URL
+      await sendEmail({
+        to: user.email, // User's email to send the reset information
+        subject: "Password Reset Request", // Email subject
+        template: "passwordReset", // Use a predefined email template
+        context: {
+          name: user.fullName, // Include the user's full name in the email template
+          otp: otp, // Include the generated OTP
+          resetUrl: resetUrl, // Include the password reset URL
+          expiresIn: OTP_EXPIRATION_TIME, // Include the expiration time for the OTP and link
+        },
+        session, // Optionally track email sending as part of the transaction
+      });
+
+      // Step 10: Commit the transaction to apply all changes
+      // If all operations (user update, email sending) are successful, commit the transaction to save the changes
+      await session.commitTransaction();
+
+      // Step 11: Send a successful response back to the client
+      // Return a success message and the reset URL to the user
+      return new ApiResponse(
+        StatusCodes.OK,
+        { resetUrl }, // Send the reset URL in the response
+        "OTP and Password Reset link sent to your email."
+      ).send(res);
+    } catch (error) {
+      // Step 12: Handle errors and abort the transaction if any operation fails
+      // If an error occurs at any point, abort the transaction to ensure no changes are persisted
+      await session.abortTransaction();
+      throw error; // Rethrow the error for further handling by the global error handler
+    } finally {
+      // Step 13: End the session after the transaction is complete (whether successful or not)
+      // Clean up and end the Mongoose session to release resources
+      session.endSession();
     }
-
-    // Generate a new password reset token and OTP for the user
-    const resetToken = user.generatePasswordResetToken(); // Use the method to generate the reset token
-    const otp = generateOTP(); // OTP generation logic
-    const otpExpiration = new Date(Date.now() + 15 * 60 * 1000); // OTP expiration in 15 minutes
-
-    // Assign generated OTP and expiration to the user
-    user.otp = otp;
-    user.otpExpiration = otpExpiration;
-
-    // Assign the reset token and expiration to the user
-    user.passwordResetToken = resetToken;
-    user.passwordResetTokenExpiration = Date.now() + 15 * 60 * 1000; // Token expiration in 15 minutes
-
-    // Save the updated user details, without validation before saving
-    await user.save({ validateBeforeSave: false });
-
-    // Generate the password reset URL with the reset token
-    const resetUrl = `http://localhost:3000/api/v1/auth/reset-password?token=${resetToken}`;
-
-    // Send the password reset email to the user with OTP and reset URL
-    await sendEmail({
-      to: user.email,
-      subject: "Password Reset Request",
-      template: "passwordReset",
-      context: {
-        name: user.fullName, // Pass user's full name to the email template
-        otp: otp, // Pass generated OTP to the email template
-        resetUrl: resetUrl, // Pass the password reset URL to the email template
-        expiresIn: "15 minutes", // Inform the user the OTP and link will expire in 15 minutes
-      },
-    });
-
-    // Return a successful response with the reset URL
-    return new ApiResponse(
-      StatusCodes.OK,
-      { resetUrl },
-      "OTP and Password Reset link sent to your email."
-    ).send(res);
   }),
 
   // Controller for Reset Password Using OTP functionality for User
@@ -626,7 +793,7 @@ const AuthController = {
     // Extract required fields from request body
     const { email, otp, newPassword, confirmPassword } = req.body;
 
-    // Check if all fields are provided
+    // Step 1: Check if all fields are provided
     if ([email, otp, newPassword, confirmPassword].some((field) => !field)) {
       throw new ApiError(
         StatusCodes.BAD_REQUEST,
@@ -634,41 +801,59 @@ const AuthController = {
       );
     }
 
-    // Check if newPassword and confirmPassword match
+    // Step 2: Check if newPassword and confirmPassword match
     if (newPassword !== confirmPassword) {
       throw new ApiError(StatusCodes.BAD_REQUEST, "Passwords do not match.");
     }
 
-    // Find user by email and select otp-related fields explicitly
-    const user = await User.findOne({ email }).select("+otp +otpExpiration");
+    // Step 3: Start a Mongoose session for transaction handling
+    const session = await mongoose.startSession();
+    session.startTransaction();
 
-    // If user not found, throw error
-    if (!user) {
-      throw new ApiError(StatusCodes.NOT_FOUND, "User not found.");
+    try {
+      // Step 4: Find user by email and select OTP-related fields explicitly
+      const user = await User.findOne({ email })
+        .select("+otp +otpExpiration")
+        .session(session); // Use session here
+
+      // Step 5: If user not found, throw an error
+      if (!user) {
+        throw new ApiError(StatusCodes.NOT_FOUND, "User not found.");
+      }
+
+      // Step 6: Validate provided OTP
+      const isValid = await user.compareOTP(otp);
+
+      // Step 7: If OTP is invalid or expired, throw an error
+      if (!isValid) {
+        throw new ApiError(StatusCodes.BAD_REQUEST, "Invalid or expired OTP.");
+      }
+
+      // Step 8: OTP is valid: reset the password and clear OTP-related fields
+      user.password = newPassword; // Update password
+      user.otp = undefined; // Clear OTP field
+      user.otpExpiration = undefined; // Clear OTP expiration field
+      user.passwordResetToken = undefined; // Clear the password reset token field
+
+      // Step 9: Save updated user details within the session
+      await user.save({ validateBeforeSave: false }, { session });
+
+      // Step 10: Commit the transaction if everything is successful
+      await session.commitTransaction();
+
+      // Step 11: Send success response
+      return new ApiResponse(
+        StatusCodes.OK,
+        "Password reset successfully via OTP."
+      ).send(res);
+    } catch (error) {
+      // Step 12: If any error occurs, abort the transaction and throw the error
+      await session.abortTransaction();
+      throw error; // Rethrow the error for global error handling
+    } finally {
+      // Step 13: End the session after the transaction is complete (whether successful or not)
+      session.endSession();
     }
-
-    // Validate provided OTP
-    const isValid = await user.compareOTP(otp);
-
-    // If OTP is invalid or expired, throw error
-    if (!isValid) {
-      throw new ApiError(StatusCodes.BAD_REQUEST, "Invalid or expired OTP.");
-    }
-
-    // OTP is valid: reset the password and clear OTP-related fields
-    user.password = newPassword;
-    user.otp = undefined;
-    user.otpExpiration = undefined;
-    user.passwordResetToken = undefined;
-
-    // Save updated user details
-    await user.save();
-
-    // Send success response
-    return new ApiResponse(
-      StatusCodes.OK,
-      "Password reset successfully via OTP."
-    ).send(res);
   }),
 
   // Controller to reset password using reset token
@@ -678,7 +863,7 @@ const AuthController = {
     // Extract required fields from request body
     const { email, newPassword, confirmPassword } = req.body;
 
-    // Validate required inputs
+    // Step 1: Validate required inputs
     if (!token) {
       throw new ApiError(StatusCodes.BAD_REQUEST, "Token is required.");
     }
@@ -694,43 +879,61 @@ const AuthController = {
       );
     }
 
-    // Ensure new password and confirm password match
+    // Step 2: Ensure new password and confirm password match
     if (newPassword !== confirmPassword) {
       throw new ApiError(StatusCodes.BAD_REQUEST, "Passwords do not match.");
     }
 
-    // Find user by email and validate token and its expiration
-    const user = await User.findOne({
-      email,
-      passwordResetToken: token,
-      passwordResetTokenExpiration: { $gt: new Date() }, // Check if token is still valid (not expired)
-    }).select(
-      "+otp +otpExpiration +passwordResetToken +passwordResetTokenExpiration" // Select additional fields required
-    );
+    // Step 3: Start a Mongoose session for transaction handling
+    const session = await mongoose.startSession();
+    session.startTransaction();
 
-    // If user not found or token invalid/expired
-    if (!user) {
-      throw new ApiError(
-        StatusCodes.BAD_REQUEST,
-        "Invalid or expired reset token."
-      );
+    try {
+      // Step 4: Find user by email, token, and ensure token is not expired
+      const user = await User.findOne({
+        email,
+        passwordResetToken: token,
+        passwordResetTokenExpiration: { $gt: new Date() }, // Token should not be expired
+      })
+        .select(
+          "+otp +otpExpiration +passwordResetToken +passwordResetTokenExpiration" // Select necessary fields
+        )
+        .session(session); // Use session for transaction handling
+
+      // Step 5: If user not found or token invalid/expired, throw error
+      if (!user) {
+        throw new ApiError(
+          StatusCodes.BAD_REQUEST,
+          "Invalid or expired reset token."
+        );
+      }
+
+      // Step 6: Update user's password and clear password reset fields
+      user.password = newPassword; // Set new password
+      user.passwordResetToken = undefined; // Clear reset token
+      user.passwordResetTokenExpiration = undefined; // Clear reset token expiration
+      user.otp = undefined; // Clear OTP field
+      user.otpExpiration = undefined; // Clear OTP expiration
+
+      // Step 7: Save updated user document within the session
+      await user.save({ validateBeforeSave: false }, { session });
+
+      // Step 8: Commit the transaction if everything is successful
+      await session.commitTransaction();
+
+      // Step 9: Send success response
+      return new ApiResponse(
+        StatusCodes.OK,
+        "Password reset successfully via link."
+      ).send(res);
+    } catch (error) {
+      // Step 10: If any error occurs, abort the transaction and throw the error
+      await session.abortTransaction();
+      throw error; // Rethrow the error for global error handling
+    } finally {
+      // Step 11: End the session after the transaction is complete (whether successful or not)
+      session.endSession();
     }
-
-    // Update user's password and clear password reset fields
-    user.password = newPassword;
-    user.passwordResetToken = undefined;
-    user.passwordResetTokenExpiration = undefined;
-    user.otp = undefined;
-    user.otpExpiration = undefined;
-
-    // Save updated user document
-    await user.save();
-
-    // Send success response
-    return new ApiResponse(
-      StatusCodes.OK,
-      "Password reset successfully via link."
-    ).send(res);
   }),
 
   // Controller to log out a user
@@ -743,231 +946,270 @@ const AuthController = {
       throw new ApiError(StatusCodes.BAD_REQUEST, "Refresh token required");
     }
 
-    // Step 2: Authenticate user using the refresh token
-    const user = await User.authenticateToken(refreshToken);
+    // Step 2: Start a Mongoose session for transaction handling
+    const session = await mongoose.startSession();
+    session.startTransaction();
 
-    // Step 3: Handle invalid or expired refresh token
-    if (!user) {
-      throw new ApiError(StatusCodes.UNAUTHORIZED, "Invalid refresh token.");
-    }
-
-    // Step 4: Remove the used refresh token from user's stored tokens
-    user.refreshTokens = user.refreshTokens.filter(
-      (tokenObj) => tokenObj.token !== refreshToken
-    );
-
-    // Step 5: Also remove the matching session if access token is available
-    if (accessToken) {
-      user.sessions = user.sessions.filter(
-        (session) => session.token !== accessToken
-      );
-    }
-
-    // Step 6: Invalidate two-factor authentication status
-    user.is2faVerified = false;
-
-    // Step 7: Save the updated user without triggering full validations
-    await user.save({ validateBeforeSave: false });
-
-    // Step 8: Clear authentication cookies
-    res.clearCookie("refreshToken", OPTIONS);
-    res.clearCookie("accessToken", OPTIONS);
-
-    // Step 9: Send logout success response
-    return new ApiResponse(StatusCodes.OK, "Logged out successfully").send(res);
-  }),
-
-  // Controller to refresh user token
-  refreshToken: asyncHandler(async (req, res) => {
-    // Step 1: Extract the refresh token from cookies
-    const token = req.cookies?.refreshToken;
-
-    // Step 2: Validate the presence of the refresh token
-    if (!token) {
-      throw new ApiError(
-        StatusCodes.UNAUTHORIZED,
-        "No refresh token provided."
-      );
-    }
-
-    // Step 3: Verify and authenticate the user based on the refresh token
-    let user;
     try {
-      user = await User.authenticateToken(token);
-    } catch (error) {
-      throw new ApiError(StatusCodes.UNAUTHORIZED, "Invalid refresh token.");
-    }
+      // Step 3: Authenticate user using the refresh token
+      const user = await User.authenticateToken(refreshToken);
 
-    // Step 4: Ensure the user exists and the token is valid
-    if (!user) {
-      throw new ApiError(StatusCodes.UNAUTHORIZED, "Invalid refresh token.");
-    }
-
-    // Step 5: Check whether the provided refresh token exists in user's stored tokens
-    const tokenExists = user.refreshTokens.some((t) => t.token === token);
-
-    if (!tokenExists) {
-      throw new ApiError(
-        StatusCodes.UNAUTHORIZED,
-        "Refresh token is not valid."
-      );
-    }
-
-    // Step 6: Generate device fingerprint based on the incoming request
-    const Fingerprint = deviceFingerprint(req);
-
-    // Step 7: Issue new access and refresh tokens for the authenticated user
-    const { accessToken, refreshToken } = await generateTokens(
-      user._id,
-      req.ip,
-      req.headers["user-agent"],
-      Fingerprint,
-      req
-    );
-
-    // Step 8: Remove the old (used) refresh token from the database
-    await User.findByIdAndUpdate(
-      user._id,
-      {
-        $pull: { refreshTokens: { token } },
-      },
-      { new: true, validateBeforeSave: false }
-    );
-
-    // Step 9: Store the newly issued refresh token along with metadata
-    await User.findByIdAndUpdate(
-      user._id,
-      {
-        $push: {
-          refreshTokens: {
-            token: refreshToken,
-            createdAt: new Date(),
-            expiresAt: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000), // 7 days validity
-          },
-        },
-      },
-      { new: true, validateBeforeSave: false }
-    );
-
-    // Step 10: Set the new access and refresh tokens in the response cookies
-    res.cookie("accessToken", accessToken, OPTIONS);
-    res.cookie("refreshToken", refreshToken, OPTIONS);
-
-    // Step 11: Update the user's session data
-    const currentToken = req.cookies?.accessToken;
-
-    if (currentToken) {
-      // Remove the previous session associated with the old access token
-      user.sessions = user.sessions.filter((s) => s.token !== currentToken);
-
-      // Append the new session details
-      user.sessions.push({
-        token: accessToken,
-        refreshToken,
-        ip: req.ip,
-        device: req.headers["user-agent"] || "unknown",
-      });
-
-      // Retain only the latest 10 active sessions for security and performance
-      if (user.sessions.length > 10) {
-        user.sessions = user.sessions.slice(-10);
+      // Step 4: Handle invalid or expired refresh token
+      if (!user) {
+        throw new ApiError(StatusCodes.UNAUTHORIZED, "Invalid refresh token.");
       }
 
-      // Persist the updated sessions to the database
-      await user.save({ validateBeforeSave: false });
-    }
+      // Step 5: Remove the used refresh token from user's stored tokens
+      user.refreshTokens = user.refreshTokens.filter(
+        (tokenObj) => tokenObj.token !== refreshToken
+      );
 
-    // Step 12: Respond with the newly issued tokens and success message
-    return new ApiResponse(
-      StatusCodes.OK,
-      {
-        tokens: {
+      // Step 6: Also remove the matching session if access token is available
+      if (accessToken) {
+        user.sessions = user.sessions.filter(
+          (session) => session.token !== accessToken
+        );
+      }
+
+      // Step 7: Invalidate two-factor authentication status
+      user.is2faVerified = false;
+
+      // Step 8: Save the updated user document within the session
+      await user.save({ validateBeforeSave: false, session });
+
+      // Step 9: Commit the transaction if everything is successful
+      await session.commitTransaction();
+
+      // Step 10: Clear authentication cookies
+      res.clearCookie("refreshToken", OPTIONS);
+      res.clearCookie("accessToken", OPTIONS);
+
+      // Step 11: Send logout success response
+      return new ApiResponse(StatusCodes.OK, "Logged out successfully").send(
+        res
+      );
+    } catch (error) {
+      // Step 12: If any error occurs, abort the transaction and throw the error
+      await session.abortTransaction();
+      throw error;
+    } finally {
+      // Step 13: End the session after the transaction is complete (whether successful or not)
+      session.endSession();
+    }
+  }),
+
+  // Controller to Refresh Token for User
+  refreshToken: asyncHandler(async (req, res) => {
+    const session = await mongoose.startSession(); // Start a MongoDB session
+
+    try {
+      // Step 1: Extract the refresh token from cookies
+      const incomingRefreshToken = req.cookies?.refreshToken;
+
+      if (!incomingRefreshToken) {
+        throw new ApiError(StatusCodes.UNAUTHORIZED, "Unauthorized request");
+      }
+
+      // Step 2: Verify the refresh token and find the user
+      const user = await User.authenticateToken(incomingRefreshToken);
+
+      if (!user) {
+        throw new ApiError(StatusCodes.UNAUTHORIZED, "Invalid refresh token");
+      }
+
+      // Step 3: Check if the refresh token exists inside user's refreshTokens array
+      const tokenEntry = user.refreshTokens.find(
+        (t) => t.token === incomingRefreshToken
+      );
+
+      if (!tokenEntry) {
+        throw new ApiError(StatusCodes.UNAUTHORIZED, "Refresh token not found");
+      }
+
+      // Step 4: Check if the refresh token has expired
+      if (tokenEntry.expiresAt < new Date()) {
+        throw new ApiError(StatusCodes.UNAUTHORIZED, "Refresh token expired");
+      }
+
+      // Step 5: Parse device/browser information for session tracking
+      const fingerprint = deviceFingerprint(req);
+
+      // Step 6: Generate new access and refresh tokens
+      const { accessToken, refreshToken } = await generateTokens(
+        user._id,
+        req.ip,
+        req.headers["user-agent"],
+        fingerprint,
+        req
+      );
+
+      // Start transaction
+      session.startTransaction();
+
+      // Step 7: Remove the old refresh token and add the new one
+      user.refreshTokens = user.refreshTokens.filter(
+        (t) => t.token !== incomingRefreshToken
+      );
+      user.refreshTokens.push({
+        token: refreshToken,
+        createdAt: new Date(),
+        expiresAt: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000), // 7 days validity
+      });
+
+      // Step 8: Reset login attempts, log session details, and save the user
+      await User.findByIdAndUpdate(
+        user._id,
+        {
+          $set: {
+            loginAttempts: 0, // Reset failed login attempts
+            lockUntil: undefined, // Unlock account if previously locked
+            lastLogin: {
+              ip: req.ip,
+              device: req.headers["user-agent"],
+              timestamp: new Date(),
+            },
+          },
+          $push: {
+            sessions: {
+              ipAddress: req.ip,
+              userAgent: req.headers["user-agent"],
+              deviceFingerprint: fingerprint,
+              createdAt: new Date(),
+            },
+          },
+          refreshTokens: user.refreshTokens, // Updated refreshTokens
+        },
+        { session, validateBeforeSave: false, new: true }
+      );
+
+      // Commit transaction
+      await session.commitTransaction();
+      session.endSession(); // End session
+
+      // Step 9: Set secure HTTP-only cookies for tokens
+      res
+        .cookie("accessToken", accessToken, OPTIONS) // Secure access token cookie
+        .cookie("refreshToken", refreshToken, OPTIONS); // Secure refresh token cookie
+
+      // Step 10: Send success response
+      return new ApiResponse(
+        StatusCodes.OK,
+        {
           accessToken,
           refreshToken,
         },
-      },
-      "Your session has been refreshed successfully. New tokens have been issued."
-    ).send(res);
+        "Tokens refreshed successfully."
+      ).send(res);
+    } catch (error) {
+      await session.abortTransaction(); // If any error occurs, abort transaction
+      session.endSession();
+      throw error; // Propagate error
+    }
   }),
 
-  // Controller to refresh user OTP
+  // Controller to refresh OTP
   refreshOTP: asyncHandler(async (req, res) => {
     // Step 1: Extract email from the request body
     const { email } = req.body;
 
-    // Step 2: Find the user by email, selecting OTP-related fields
-    const user = await User.findOne({ email }).select(
-      "+otp +otpExpiration +otpAttempts +otpBlockedUntil"
-    );
+    // Start a Mongoose session for transaction handling
+    const session = await mongoose.startSession();
+    session.startTransaction();
 
-    // Step 3: Always respond with a generic message to prevent user enumeration
-    if (!user) {
+    try {
+      // Step 2: Find the user by email, selecting OTP-related fields
+      const user = await User.findOne({ email })
+        .select("+otp +otpExpiration +otpAttempts +otpBlockedUntil")
+        .session(session); // Include the session here
+
+      // Step 3: Always respond with a generic message to prevent user enumeration
+      if (!user) {
+        await session.commitTransaction(); // Commit if user not found
+        return new ApiResponse(
+          StatusCodes.OK,
+          "If an account exists with this email, a new OTP has been sent for verification. Please check your inbox."
+        ).send(res);
+      }
+
+      // Step 4: If the email is already verified, prevent further OTP generation
+      if (user.isEmailVerified) {
+        await session.commitTransaction(); // Commit if email is verified
+        throw new ApiError(
+          StatusCodes.BAD_REQUEST,
+          "Email is already verified."
+        );
+      }
+
+      // Step 5: Check if the user is temporarily blocked due to too many OTP attempts
+      if (user.otpBlockedUntil && user.otpBlockedUntil > new Date()) {
+        const remainingTime = Math.ceil(
+          (user.otpBlockedUntil - Date.now()) / (60 * 1000) // Minutes remaining
+        );
+        await session.commitTransaction(); // Commit if blocked
+        throw new ApiError(
+          StatusCodes.TOO_MANY_REQUESTS,
+          `Too many OTP attempts. Please try again after ${remainingTime} minutes.`
+        );
+      }
+
+      // Step 6: Generate a fresh OTP and set its expiration time (10 minutes)
+      const otp = generateOTP();
+      const otpExpiration = new Date(Date.now() + 10 * 60 * 1000);
+
+      // Step 7: Reset OTP fields on the user document
+      user.otp = otp;
+      user.otpExpiration = otpExpiration;
+      user.otpAttempts = 0;
+
+      // Step 8: Save the updated user document without validation checks
+      await user.save({ validateBeforeSave: false, session });
+
+      // Step 9: Send the OTP email to the user
+      try {
+        await sendEmail({
+          to: user.email,
+          subject: "Verify Your Email",
+          template: "emailVerification", // Assumes you're using templated emails
+          context: {
+            name: user.fullName,
+            otp,
+            expiresIn: "10 minutes",
+          },
+        });
+      } catch (error) {
+        // If sending email fails, clean up OTP fields for security
+        user.otp = undefined;
+        user.otpExpiration = undefined;
+        await user.save({ validateBeforeSave: false, session });
+
+        // Rollback the transaction
+        await session.abortTransaction();
+
+        throw new ApiError(
+          StatusCodes.INTERNAL_SERVER_ERROR,
+          "Failed to send verification email."
+        );
+      }
+
+      // Step 10: Commit the transaction if all steps are successful
+      await session.commitTransaction();
+
+      // Step 11: Respond with a success message (even if user was not found initially)
       return new ApiResponse(
         StatusCodes.OK,
         "If an account exists with this email, a new OTP has been sent for verification. Please check your inbox."
       ).send(res);
-    }
-
-    // Step 4: If the email is already verified, prevent further OTP generation
-    if (user.isEmailVerified) {
-      throw new ApiError(StatusCodes.BAD_REQUEST, "Email is already verified.");
-    }
-
-    // Step 5: Check if the user is temporarily blocked due to too many OTP attempts
-    if (user.otpBlockedUntil && user.otpBlockedUntil > new Date()) {
-      const remainingTime = Math.ceil(
-        (user.otpBlockedUntil - Date.now()) / (60 * 1000) // Minutes remaining
-      );
-      throw new ApiError(
-        StatusCodes.TOO_MANY_REQUESTS,
-        `Too many OTP attempts. Please try again after ${remainingTime} minutes.`
-      );
-    }
-
-    // Step 6: Generate a fresh OTP and set its expiration time (10 minutes)
-    const otp = generateOTP();
-    const otpExpiration = new Date(Date.now() + 10 * 60 * 1000);
-
-    // Step 7: Reset OTP fields on the user document
-    user.otp = otp;
-    user.otpExpiration = otpExpiration;
-    user.otpAttempts = 0;
-
-    // Step 8: Save the updated user document without validation checks
-    await user.save({ validateBeforeSave: false });
-
-    // Step 9: Send the OTP email to the user
-    try {
-      await sendEmail({
-        to: user.email,
-        subject: "Verify Your Email",
-        template: "emailVerification", // Assumes you're using templated emails
-        context: {
-          name: user.fullName,
-          otp,
-          expiresIn: "10 minutes",
-        },
-      });
     } catch (error) {
-      // If sending email fails, clean up OTP fields for security
-      user.otp = undefined;
-      user.otpExpiration = undefined;
-      await user.save({ validateBeforeSave: false });
-
-      throw new ApiError(
-        StatusCodes.INTERNAL_SERVER_ERROR,
-        "Failed to send verification email."
-      );
+      // If an error occurs, abort the transaction
+      await session.abortTransaction();
+      throw error;
+    } finally {
+      // End the session after the transaction is complete (whether successful or not)
+      session.endSession();
     }
-
-    // Step 10: Respond with a success message (even if user was not found initially)
-    return new ApiResponse(
-      StatusCodes.OK,
-      "If an account exists with this email, a new OTP has been sent for verification. Please check your inbox."
-    ).send(res);
   }),
 
-  // Controller to Refresh and regenerate a new QR Code
+  // Controller to refresh OTP
   refreshQrCode: asyncHandler(async (req, res) => {
     const { email } = req.body;
 

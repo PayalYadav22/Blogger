@@ -3,13 +3,15 @@ import AuthController from "../controllers/auth/auth.controller.js";
 import upload from "../middleware/multer.middleware.js";
 import {
   authLimiter,
+  registerLimiter,
   passwordResetLimiter,
 } from "../middleware/rateLimit.middleware.js";
 import validateFile from "../middleware/validateFile.middleware.js";
 import authenticate from "../middleware/authenticate.middleware.js";
 import require2FA from "../middleware/require2FA.middleware.js";
 import SessionActivity from "../middleware/sessionActivity.middleware.js";
-
+import validate from "../middleware/validate.middleware.js";
+import { registerValidUser } from "../validation/user.validation.js";
 const router = express.Router();
 
 /* ------------------------------- Public Routes ------------------------------- */
@@ -19,8 +21,9 @@ router
   .route("/register")
   .post(
     upload.single("avatar"),
-    authLimiter,
+    registerLimiter,
     validateFile,
+    validate(registerValidUser),
     AuthController.registerUser
   );
 
