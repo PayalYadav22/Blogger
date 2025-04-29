@@ -5,34 +5,27 @@ import authorizeRoles from "../middleware/authorizeRoles.middleware.js";
 
 const router = express.Router();
 
+// Middleware to authenticate and authorize admin access
 router.use(authenticate);
 router.use(authorizeRoles("admin"));
 
-// GET all users (with optional filters & search)
-router.get("/users", AdminController.getAllUsers);
+// Bulk & Reported Users
+router.route("/users").get(AdminController.getAllUsers);
+router.route("/reported-users").get(AdminController.getReportedUsers);
 
-// GET reported users
-router.get("/reported-users", AdminController.getReportedUsers);
+// Single User Operations
+router
+  .route("/users/:id")
+  .get(AdminController.getUser)
+  .patch(AdminController.updateUser)
+  .delete(AdminController.deleteUser);
 
-// GET single user by ID
-router.get("/users/:id", AdminController.getUser);
+// Suspension & Role Management
+router.route("/users/:id/suspend").patch(AdminController.suspendUser);
+router.route("/users/:id/unsuspend").patch(AdminController.unsuspendUser);
+router.route("/users/:id/promote").patch(AdminController.promoteUser);
 
-// PUT update user by ID
-router.patch("/users/:id", AdminController.updateUser);
-
-// PATCH suspend user
-router.patch("/users/:id/suspend", AdminController.suspendUser);
-
-// PATCH unsuspend user
-router.patch("/users/:id/unsuspend", AdminController.unsuspendUser);
-
-// PATCH promote user (e.g., to admin, moderator, etc.)
-router.patch("/users/:id/promote", AdminController.promoteUser);
-
-// DELETE user (soft or hard delete depending on your model)
-router.delete("/users/:id", AdminController.deleteUser);
-
-// POST warn a user
-router.post("/users/:id/warn", AdminController.warnUser);
+// User Warnings
+router.route("/users/:id/warn").post(AdminController.warnUser);
 
 export default router;

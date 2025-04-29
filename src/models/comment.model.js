@@ -2,41 +2,65 @@ import mongoose from "mongoose";
 
 const commentSchema = new mongoose.Schema(
   {
-    // Reference to the user who posted the comment
-    postedBy: {
+    content: {
+      type: String,
+      required: [true, "Comment content is required."],
+      minlength: [1, "Comment must be at least 1 character long."],
+    },
+    author: {
       type: mongoose.Schema.Types.ObjectId,
       ref: "User",
       required: true,
     },
-    // Reference to the post on which the comment is made
-    postId: {
+    post: {
       type: mongoose.Schema.Types.ObjectId,
       ref: "Post",
       required: true,
     },
-    // Content of the comment
-    text: {
-      type: String,
-      required: true,
-      trim: true,
-      maxlength: 1000,
-    },
-    // Reference to the parent comment for nested comments
-    parentComment: {
+    parent: {
       type: mongoose.Schema.Types.ObjectId,
-      ref: "Comment",
+      ref: "Comment", // This references the parent comment for nested replies
       default: null,
     },
-    // Timestamp when the comment was created
-    commentedAt: {
+    isApproved: {
+      type: Boolean,
+      default: false, // New comments need approval
+    },
+    isReported: {
+      type: Boolean,
+      default: false, // Flagged for moderation
+    },
+    isDeleted: {
+      type: Boolean,
+      default: false, // Marked as deleted without removal
+    },
+    replies: [
+      {
+        type: mongoose.Schema.Types.ObjectId,
+        ref: "Comment", // Nested replies
+      },
+    ],
+    createdAt: {
+      type: Date,
+      default: Date.now,
+    },
+    updatedAt: {
       type: Date,
       default: Date.now,
     },
   },
   {
-    timestamps: true, // Automatically adds createdAt and updatedAt fields
+    timestamps: true,
   }
 );
+
+// Automatically update `updatedAt` field when the comment is modified
+commentSchema.pre("save", function (next) {
+  if (this.isModified("content")) {
+    this.updatedAt = Date.now();
+  }
+  next();
+});
 
 const Comment = mongoose.model("Comment", commentSchema);
 
