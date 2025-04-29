@@ -13,6 +13,11 @@ import leanVirtuals from "mongoose-lean-virtuals";
 import leanGetters from "mongoose-lean-getters";
 import { StatusCodes } from "http-status-codes";
 
+// Models
+import Post from "./post.model.js";
+import Comment from "./comment.model.js";
+import Follow from "./follow.model.js";
+
 // Plugins
 import softDeletePlugin from "../plugins/softDelete.plugin.js";
 
@@ -315,10 +320,28 @@ const UserSchema = new mongoose.Schema(
     // User privacy settings
     // ------------------------------
     profilePrivacy: {
-      type: String,
-      enum: ["public", "private", "friends"],
-      default: "public",
+      type: Map,
+      of: Boolean,
+      default: {
+        profileVisible: true,
+        searchable: false,
+      },
     },
+
+    // ------------------------------
+    // User Warnings settings
+    // ------------------------------
+    warnings: [
+      {
+        reason: { type: String, required: true },
+        issuedBy: {
+          type: mongoose.Schema.Types.ObjectId,
+          ref: "User",
+          required: true,
+        },
+        issuedAt: { type: Date, default: Date.now },
+      },
+    ],
 
     // ------------------------------
     // Miscellaneous tracking
@@ -400,6 +423,12 @@ const UserSchema = new mongoose.Schema(
     likes: [{ type: mongoose.Schema.Types.ObjectId, ref: "Post", default: [] }],
     bookmarks: [
       { type: mongoose.Schema.Types.ObjectId, ref: "Post", default: [] },
+    ],
+    reportedBy: [
+      {
+        type: mongoose.Schema.Types.ObjectId,
+        ref: "User",
+      },
     ],
 
     // ------------------------------

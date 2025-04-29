@@ -1,0 +1,28 @@
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Account Activated</title>
+    <style>
+      body { font-family: Arial, sans-serif; background-color: #f8f9fa; display:
+      flex; justify-content: center; align-items: center; height: 100vh; margin:
+      0; } .container { text-align: center; background-color: #ffffff; padding:
+      40px; border-radius: 8px; box-shadow: 0 4px 8px rgba(0, 0, 0, 0.1); width:
+      100%; max-width: 400px; } .message { font-size: 18px; color: #333;
+      margin-bottom: 20px; } .action-btn { background-color: #28a745; color:
+      white; padding: 10px 20px; border: none; border-radius: 4px;
+      text-decoration: none; font-size: 16px; cursor: pointer; }
+      .action-btn:hover { background-color: #218838; }
+    </style>
+  </head>
+  <body>
+
+    <div class="container">
+      <h1>{{name}}, Your Account Has Been Activated!</h1>
+      <p class="message">Your account is now active. You can log in and start
+        using our services.</p>
+      <a href="{{loginUrl}}" class="action-btn">Go to Login</a>
+    </div>
+
+  </body>
+</html>

@@ -91,6 +91,25 @@ const deviceFingerprint = (req) => {
   return fingerprint;
 };
 
+async function verifyRecaptcha(recaptchaToken) {
+  const secretKey = GOOGLE_SECRET_KEY; // Store securely
+  const url = `https://www.google.com/recaptcha/api/siteverify`;
+
+  try {
+    const response = await axios.post(url, null, {
+      params: {
+        secret: secretKey,
+        response: recaptchaToken,
+      },
+    });
+
+    return response.data; // Google returns success: true/false
+  } catch (error) {
+    console.error("ReCAPTCHA verification error:", error);
+    return { success: false }; // Default to failure
+  }
+}
+
 const AuthController = {
   // Controller: Register a new user
   registerUser: asyncHandler(async (req, res) => {
@@ -246,7 +265,7 @@ const AuthController = {
           qrCode: user.qrCode,
         },
         "Registration successful! Verify your email."
-      );
+      ).send(res);
     } catch (error) {
       await session.abortTransaction();
       session.endSession();

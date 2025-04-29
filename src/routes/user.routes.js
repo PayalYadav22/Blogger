@@ -3,6 +3,7 @@ import UserController from "../controllers/users/users.controller.js";
 import authenticate from "../middleware/authenticate.middleware.js";
 import require2FA from "../middleware/require2FA.middleware.js";
 import authorizeRoles from "../middleware/authorizeRoles.middleware.js";
+import upload from "../middleware/multer.middleware.js";
 
 const router = express.Router();
 
@@ -20,7 +21,9 @@ router
   .get(UserController.getLoggedInUser)
   .patch(UserController.updateUserProfile);
 router.route("/change-password").patch(UserController.changeUserPassword);
-router.put("/me/avatar", UserController.updateUserAvatar);
+router
+  .route("/avatar")
+  .patch(upload.single("avatar"), UserController.updateUserAvatar);
 
 // ================= User Content Routes =================
 
@@ -38,7 +41,7 @@ router.get(
   authorizeRoles("admin", "subscriber"),
   UserController.getMySubscription
 );
-router.put(
+router.patch(
   "/me/subscription",
   authorizeRoles("admin", "subscriber"),
   UserController.updateMySubscription
@@ -47,7 +50,7 @@ router.put(
 // ================= Other Settings =================
 
 // Preferences update
-router.put("/me/preferences", UserController.updateUserPreferences);
+router.patch("/me/preferences", UserController.updateUserPreferences);
 
 // Deactivate own account
 router.delete("/me/deactivate", UserController.deactivateUserAccount);
@@ -57,6 +60,7 @@ router.delete("/me/deactivate", UserController.deactivateUserAccount);
 // Anyone logged in can search or view public profiles
 router.get("/search", UserController.searchUsers);
 router.get("/popular", UserController.getPopularUsers);
-router.get("/:userId", UserController.getUserProfile);
+router.get("/activity", UserController.getMyActivity);
+router.get("/me/:id", UserController.getUserProfile);
 
 export default router;
