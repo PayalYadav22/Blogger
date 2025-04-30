@@ -157,7 +157,7 @@ const mediaSchema = new mongoose.Schema(
     },
   },
   {
-    timestamps: true, // adds createdAt and updatedAt fields automatically
+    timestamps: true,
   }
 );
 
