@@ -6,23 +6,24 @@ const LikeSchema = new mongoose.Schema(
       type: mongoose.Schema.Types.ObjectId,
       ref: "Post",
       required: true,
+      index: true,
     },
     user: {
       type: mongoose.Schema.Types.ObjectId,
       ref: "User",
       required: true,
+      index: true,
     },
-    likedAt: {
-      type: Date,
-      default: Date.now,
+    isDeleted: {
+      type: Boolean,
+      default: false,
     },
   },
   {
-    timestamps: true, // adds createdAt and updatedAt fields automatically
+    timestamps: true,
   }
 );
 
-// Ensure that a user can like a post only once
 LikeSchema.index({ post: 1, user: 1 }, { unique: true });
 
 const Like = mongoose.model("Like", LikeSchema);
